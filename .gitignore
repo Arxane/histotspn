@@ -1,0 +1,11 @@
+BCI_dataset/
+__pycache__/
+*.pyc
+*.Identifier
+.env
+.venv/
+venv/
+artifacts/
+pre_distill/
+distill_method/
+distill_fail/
