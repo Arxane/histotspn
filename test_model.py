@@ -9,6 +9,7 @@ from typing import Dict, Iterable, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
+import hashlib
 
 from main import (
 	PipelineConfig,
@@ -30,8 +31,8 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--tspn-checkpoint", type=str, default=None)
 	parser.add_argument("--classifier-checkpoint", type=str, default=None)
 	parser.add_argument("--output-dir", type=str, default="validation_outputs")
-	parser.add_argument("--patch-size", type=int, default=512)
-	parser.add_argument("--stride", type=int, default=512)
+	parser.add_argument("--patch-size", type=int, default=128)
+	parser.add_argument("--stride", type=int, default=128)
 	parser.add_argument("--min-tissue-fraction", type=float, default=0.5)
 	parser.add_argument("--conch-batch-size", type=int, default=32)
 	parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -178,34 +179,69 @@ def evaluate(pipeline, feature_pairs, device: torch.device):
 
 
 def main() -> None:
-	args = parse_args()
-	final_checkpoint, tspn_checkpoint, classifier_checkpoint = select_checkpoints(args)
-	device = torch.device(args.device)
-	checkpoint_label = final_checkpoint or Path(f"{tspn_checkpoint} + {classifier_checkpoint}")
-	print(f"Using checkpoint(s): {checkpoint_label}")
+    args = parse_args()
+    final_checkpoint, tspn_checkpoint, classifier_checkpoint = select_checkpoints(args)
 
-	pipeline, config = load_pipeline(args, device, final_checkpoint, tspn_checkpoint, classifier_checkpoint)
-	feature_model, preprocess = load_biomedclip_model()
-	feature_model = feature_model.to(device).eval()
-	samples = load_paired_wsi_samples(config.data_root, "test")
-	feature_pairs = build_feature_pairs(
-		samples,
-		build_patch_extractor(config),
-		feature_model,
-		preprocess,
-		device,
-		config.conch_batch_size,
-	)
-	metrics, predictions = evaluate(pipeline, feature_pairs, device)
+    device = torch.device(args.device)
 
-	output_dir = Path(args.output_dir)
-	output_dir.mkdir(parents=True, exist_ok=True)
-	(output_dir / "test_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-	torch.save(predictions, output_dir / "test_predictions.pt")
-	print(json.dumps(metrics, indent=2))
-	print(f"Saved metrics to {output_dir / 'test_metrics.json'}")
-	print(f"Saved predictions to {output_dir / 'test_predictions.pt'}")
+    checkpoint_label = final_checkpoint or Path(
+        f"{tspn_checkpoint} + {classifier_checkpoint}"
+    )
+    print(f"Using checkpoint(s): {checkpoint_label}")
+
+    pipeline, config = load_pipeline(
+        args,
+        device,
+        final_checkpoint,
+        tspn_checkpoint,
+        classifier_checkpoint,
+    )
+
+    feature_model, preprocess, _ = load_biomedclip_model()
+    feature_model = feature_model.to(device).eval()
+
+    samples = load_paired_wsi_samples(config.data_root, "test")
+
+    # Cache extracted features separately for this preprocessing configuration.
+    cfg_hash = hashlib.md5(
+        f"{args.patch_size}_{args.stride}_{args.min_tissue_fraction}".encode()
+    ).hexdigest()[:8]
+
+    cache_root = Path("feature_cache") / cfg_hash / "test"
+
+    feature_pairs = build_feature_pairs(
+        samples,
+        build_patch_extractor(config),
+        feature_model,
+        preprocess,
+        device,
+        config.conch_batch_size,
+        cache_root=cache_root,
+    )
+
+    metrics, predictions = evaluate(
+        pipeline,
+        feature_pairs,
+        device,
+    )
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    (output_dir / "test_metrics.json").write_text(
+        json.dumps(metrics, indent=2),
+        encoding="utf-8",
+    )
+
+    torch.save(
+        predictions,
+        output_dir / "test_predictions.pt",
+    )
+
+    print(json.dumps(metrics, indent=2))
+    print(f"Saved metrics to {output_dir / 'test_metrics.json'}")
+    print(f"Saved predictions to {output_dir / 'test_predictions.pt'}")
 
 
 if __name__ == "__main__":
-	main()
+    main()

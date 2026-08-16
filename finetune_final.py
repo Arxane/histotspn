@@ -22,7 +22,7 @@ from main import (
     unfreeze_module,
 )
 from tspn import mmd_loss
-
+import hashlib
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Jointly fine-tune seed-based TSPN and ABMIL classifier.")
@@ -58,11 +58,15 @@ def build_feature_pairs_for_split(args, split):
         classifier_layers=args.classifier_layers,
     )
     device = torch.device(args.device)
-    feature_model, preprocess = load_biomedclip_model()
+    feature_model, preprocess, _ = load_biomedclip_model()
     feature_model = feature_model.to(device).eval()
     samples = load_paired_wsi_samples(config.data_root, split)
+    cfg_hash   = hashlib.md5(
+        f"{args.patch_size}_{args.stride}_{args.min_tissue_fraction}".encode()
+    ).hexdigest()[:8]
+    cache_root = Path("feature_cache") / cfg_hash / split
     pairs = build_feature_pairs(
-        samples, build_patch_extractor(config), feature_model, preprocess, device, config.conch_batch_size
+        samples, build_patch_extractor(config), feature_model, preprocess, device, config.conch_batch_size, cache_root=cache_root,
     )
     return config, pairs
 
@@ -121,6 +125,8 @@ def main() -> None:
     )
 
     history = []
+    best_eval_loss = float("inf")
+    best_epoch = 0
     for epoch in range(1, args.epochs + 1):
         train_metrics, train_acc = run_epoch(
             model, train_pairs, optimizer, device, args.classification_weight, args.mmd_weight, True
@@ -136,24 +142,40 @@ def main() -> None:
             **{f"eval_{key}": value for key, value in eval_metrics.items()},
         }
         history.append(record)
+
         print(
             f"Epoch {epoch:03d} | train_loss={train_metrics['loss']:.6f} | "
             f"eval_loss={eval_metrics['loss']:.6f} | eval_acc={eval_acc:.4f} | "
             f"eval_mmd={eval_metrics['mmd']:.6f}"
         )
 
-    checkpoint_path = output_dir / "finetuned_pipeline_checkpoint.pt"
-    torch.save(
-        {
-            "tspn_state_dict": model.tspn.state_dict(),
-            "classifier_state_dict": model.classifier.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "config": asdict(config),
-            "history": history,
-            "mmd_weight": args.mmd_weight,
-        },
-        checkpoint_path,
-    )
+        # Save only the model with the lowest evaluation loss
+        if eval_metrics["loss"] < best_eval_loss:
+            best_eval_loss = eval_metrics["loss"]
+            best_epoch = epoch
+
+            checkpoint_path = output_dir / "finetuned_pipeline_checkpoint.pt"
+
+            torch.save(
+                {
+                    "tspn_state_dict": model.tspn.state_dict(),
+                    "classifier_state_dict": model.classifier.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "config": asdict(config),
+                    "history": history,
+                    "best_eval_loss": best_eval_loss,
+                    "best_epoch": best_epoch,
+                    "mmd_weight": args.mmd_weight,
+                },
+                checkpoint_path,
+            )
+
+            print(
+                f"  ✓ New best model saved "
+                f"(epoch={best_epoch}, eval_loss={best_eval_loss:.6f})"
+            )
+
+    
     (output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     print(f"Saved finetuned pipeline checkpoint: {checkpoint_path}")
 
