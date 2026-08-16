@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from conch_runner import load_conch_model
+from biomed_runner import load_biomedclip_model
 from main import (
     PipelineConfig,
     build_conditioned_classifier,
@@ -19,6 +19,8 @@ from main import (
     build_patch_extractor,
     load_paired_wsi_samples,
 )
+
+import hashlib
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,8 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", default="BCI_dataset")
     parser.add_argument("--eval-split", choices=("validation", "test"), default="validation")
     parser.add_argument("--output-dir", default="artifacts/classifier_real")
-    parser.add_argument("--patch-size", type=int, default=256)
-    parser.add_argument("--stride", type=int, default=256)
+    parser.add_argument("--patch-size", type=int, default=128)
+    parser.add_argument("--stride", type=int, default=128)
     parser.add_argument("--min-tissue-fraction", type=float, default=0.5)
     parser.add_argument("--conch-batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=20)
@@ -51,17 +53,22 @@ def build_pairs(args: argparse.Namespace, split: str, device: torch.device):
         conch_batch_size=args.conch_batch_size,
         classifier_layers=args.classifier_layers,
     )
-    tqdm.write(f"[Data Prep | {split}] Loading CONCH feature extractor...")
-    conch_model, preprocess = load_conch_model()
-    conch_model = conch_model.to(device).eval()
+    tqdm.write(f"[Data Prep | {split}] Loading BiomedCLIP feature extractor...")
+    feature_model, preprocess, _ = load_biomedclip_model()
+    feature_model = feature_model.to(device).eval()
     samples = load_paired_wsi_samples(args.data_root, split)
+    cfg_hash   = hashlib.md5(
+        f"{args.patch_size}_{args.stride}_{args.min_tissue_fraction}".encode()
+    ).hexdigest()[:8]
+    cache_root = Path("feature_cache") / cfg_hash / split
     pairs = build_feature_pairs(
         samples,
         build_patch_extractor(config),
-        conch_model,
+        feature_model,
         preprocess,
         device,
         config.conch_batch_size,
+        cache_root=cache_root,
     )
     return config, pairs
 

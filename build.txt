@@ -1,0 +1,375 @@
+================================================================================
+HistoTSPN PIPELINE - BUILD & RUN COMMANDS
+================================================================================
+Updated for BiomedCLIP feature extractor and 64-patch extraction targets
+
+DEPENDENCIES
+============
+pip install -r requirements.txt
+pip install open_clip_torch  # For BiomedCLIP image encoding
+
+ENVIRONMENT SETUP
+=================
+conda activate histotspn
+
+SMOKE TEST (Validate pipeline integration)
+===========================================
+python smoke_test_biomedclip.py
+# Verifies:
+# - BiomedCLIP model loads correctly
+# - Image preprocessing works
+# - Feature extraction produces 512-dim vectors
+# - Integration with patch extraction pipeline
+
+================================================================================
+MAIN PIPELINE: THREE-STAGE TRAINING + EVALUATION
+================================================================================
+
+FULL PIPELINE (Run all stages in sequence)
+===========================================
+# Complete end-to-end training with default settings
+python main.py train-full \
+  --data-root BCI_dataset \
+  --output-base artifacts \
+  --patch-size 128 \
+  --stride 128 \
+  --device cuda
+
+# Or run stages separately for more control (see below)
+
+================================================================================
+STAGE 0: TRAIN CLASSIFIER ON REAL HE + REAL IHC FEATURES
+================================================================================
+Description: Trains a classifier baseline using real tissue modalities.
+             Serves as the teacher model for later distillation.
+
+QUICK START (Default settings):
+------------------------------
+python train_classifier_real.py \
+  --data-root BCI_dataset \
+  --output-dir artifacts/classifier_real \
+  --eval-split validation
+
+FULL CONTROL (All configurable parameters):
+-------------------------------------------
+python train_classifier_real.py \
+  --data-root BCI_dataset \
+  --eval-split validation \
+  --output-dir artifacts/classifier_real \
+  --patch-size 512 \
+  --stride 512 \
+  --min-tissue-fraction 0.5 \
+  --conch-batch-size 32 \
+  --epochs 20 \
+  --early-stopping-patience 5 \
+  --early-stopping-start 1 \
+  --learning-rate 1e-4 \
+  --weight-decay 1e-4 \
+  --classifier-layers 2 \
+  --device cuda
+
+Output:
+-------
+artifacts/classifier_real/classifier_checkpoint.pt  (model weights)
+artifacts/classifier_real/history.json               (training metrics)
+
+================================================================================
+STAGE 1: TRAIN TSPN WITH DISTILLATION
+================================================================================
+Description: Trains the TSPN to generate synthetic IHC features from HE.
+             Uses the frozen Stage 0 classifier as a teacher.
+             
+Targets: ~64 patches per WSI → 64-dim synthetic IHC features
+
+QUICK START (Default settings):
+------------------------------
+python train_tspn.py \
+  --data-root BCI_dataset \
+  --classifier-checkpoint artifacts/classifier_real/classifier_checkpoint.pt \
+  --output-dir artifacts/tspn_distill \
+  --eval-split validation
+
+FULL CONTROL (All configurable parameters):
+-------------------------------------------
+python train_tspn.py \
+  --data-root BCI_dataset \
+  --classifier-checkpoint artifacts/classifier_real/classifier_checkpoint.pt \
+  --output-dir artifacts/tspn_distill \
+  --eval-split validation \
+  --patch-size 512 \
+  --stride 512 \
+  --min-tissue-fraction 0.5 \
+  --conch-batch-size 32 \
+  --epochs 5 \
+  --early-stopping-patience 5 \
+  --early-stopping-start 1 \
+  --learning-rate 1e-4 \
+  --weight-decay 1e-4 \
+  --alpha 1.0 \
+  --beta 0.5 \
+  --gamma 0.3 \
+  --delta 2.0 \
+  --eta 0.5 \
+  --temperature 4.0 \
+  --n-seeds 64 \
+  --n-heads 8 \
+  --num-decoder-layers 3 \
+  --dim-feedforward 2048 \
+  --dropout 0.1 \
+  --device cuda
+
+Loss terms (α L_MMD + β L_SWD + γ L_moment + δ L_KL + η L_CE):
+- alpha (MMD loss weight):      1.0
+- beta (SWD loss weight):       0.5
+- gamma (moment loss weight):   0.3
+- delta (KL divergence weight): 2.0
+- eta (CE loss weight):         0.5
+- temperature (KL temp):        4.0
+
+Output:
+-------
+artifacts/tspn_distill/tspn_checkpoint.pt  (TSPN model weights)
+artifacts/tspn_distill/metrics.json         (training metrics)
+
+================================================================================
+STAGE 2: JOINT FINE-TUNING (TSPN + Classifier)
+================================================================================
+Description: Unfreezes both TSPN and classifier, jointly optimizes with
+             classification loss + small MMD regularizer.
+
+QUICK START (Default settings):
+------------------------------
+python finetune_final.py \
+  --data-root BCI_dataset \
+  --tspn-checkpoint artifacts/tspn_distill/tspn_checkpoint.pt \
+  --classifier-checkpoint artifacts/classifier_real/classifier_checkpoint.pt \
+  --output-dir artifacts/final_stage \
+  --train-split train \
+  --eval-split validation
+
+FULL CONTROL (All configurable parameters):
+-------------------------------------------
+python finetune_final.py \
+  --data-root BCI_dataset \
+  --tspn-checkpoint artifacts/tspn_distill/tspn_checkpoint.pt \
+  --classifier-checkpoint artifacts/classifier_real/classifier_checkpoint.pt \
+  --output-dir artifacts/final_stage \
+  --train-split train \
+  --eval-split validation \
+  --patch-size 512 \
+  --stride 512 \
+  --min-tissue-fraction 0.5 \
+  --conch-batch-size 32 \
+  --epochs 5 \
+  --classifier-layers 2 \
+  --tspn-learning-rate 1e-5 \
+  --classifier-learning-rate 1e-4 \
+  --weight-decay 1e-4 \
+  --classification-weight 1.0 \
+  --mmd-weight 0.1 \
+  --device cuda
+
+Output:
+-------
+artifacts/final_stage/finetuned_pipeline_checkpoint.pt  (combined model)
+artifacts/final_stage/history.json                       (training metrics)
+
+================================================================================
+EVALUATION: TEST SET METRICS
+================================================================================
+
+Using final combined checkpoint:
+--------------------------------
+python test_model.py \
+  --data-root BCI_dataset \
+  --final-checkpoint artifacts/final_stage/finetuned_pipeline_checkpoint.pt \
+  --output-dir test_outputs \
+  --patch-size 512 \
+  --stride 512 \
+  --device cuda
+
+Using separate TSPN + Classifier checkpoints:
+----------------------------------------------
+python test_model.py \
+  --data-root BCI_dataset \
+  --tspn-checkpoint artifacts/tspn_distill/tspn_checkpoint.pt \
+  --classifier-checkpoint artifacts/classifier_real/classifier_checkpoint.pt \
+  --output-dir test_outputs \
+  --patch-size 512 \
+  --stride 512 \
+  --device cuda
+
+Output:
+-------
+test_outputs/test_metrics.json      (accuracy, confusion matrix, per-class metrics)
+test_outputs/test_predictions.pt    (per-sample predictions & statistics)
+
+================================================================================
+ANALYSIS: SYNTHETIC IHC FEATURE VALIDATION
+================================================================================
+
+Inspect TSPN-generated features:
+--------------------------------
+python verify_tspn.py \
+  --tspn-checkpoint artifacts/tspn_distill/tspn_checkpoint.pt \
+  --split validation \
+  --output-dir validation_outputs \
+  --patch-size 512 \
+  --stride 512 \
+  --device cuda
+
+Generates:
+- Linear probe accuracy (HE vs synthetic IHC)
+- t-SNE projections colored by HER2 grade
+- Cosine similarity metrics (intra-class vs inter-class)
+- PCA heatmaps of feature activations
+
+Output:
+-------
+validation_outputs/he_features.npy
+validation_outputs/real_ihc_features.npy
+validation_outputs/synth_ihc_features.npy
+validation_outputs/test_metrics.json
+validation_outputs/*.png  (visualizations)
+
+================================================================================
+DATA PREPARATION (Optional: Pre-extract features)
+================================================================================
+
+Prepare feature pairs without training:
+---------------------------------------
+python main.py prepare \
+  --data-root BCI_dataset \
+  --split train \
+  --output-dir artifacts/pipeline \
+  --patch-size 512 \
+  --stride 512 \
+  --device cuda
+
+Output:
+-------
+artifacts/pipeline/train_feature_pairs.pt  (cached features)
+artifacts/pipeline/train_manifest.json     (metadata)
+
+================================================================================
+FEATURE EXPORT: SAVE SYNTHETIC IHC FEATURES
+================================================================================
+
+Export synthetic IHC features from a trained TSPN:
+--------------------------------------------------
+python main.py export-tspn \
+  --checkpoint artifacts/tspn_distill/tspn_checkpoint.pt \
+  --split test \
+  --output-dir artifacts/pipeline \
+  --patch-size 512 \
+  --stride 512 \
+  --device cuda
+
+Output:
+-------
+artifacts/pipeline/synthetic_ihc_patches     (list of 64-dim feature tensors)
+artifacts/pipeline/labels                    (slide-level labels)
+artifacts/pipeline/sample_ids                (slide identifiers)
+
+================================================================================
+TROUBLESHOOTING COMMANDS
+================================================================================
+
+Sanity check (verify model shapes without data):
+-------------------------------------------------
+python main.py sanity-check
+
+Compile check:
+--------------
+python -m py_compile biomed_runner.py main.py train_tspn.py \
+  train_classifier_real.py finetune_final.py test_model.py verify_tspn.py
+
+Check environment:
+------------------
+conda activate histotspn
+python -c "import torch; import open_clip; print('✓ Dependencies OK')"
+
+List available CUDA devices:
+----------------------------
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+python -c "import torch; print(f'Devices: {torch.cuda.device_count()}')"
+
+================================================================================
+COMMON WORKFLOWS
+================================================================================
+
+Minimal: Single-GPU full pipeline (15-30 min total):
+-----------------------------------------------------
+conda activate histotspn
+python main.py train-full --data-root BCI_dataset --device cuda
+python test_model.py --final-checkpoint artifacts/final_stage/finetuned_pipeline_checkpoint.pt
+
+Debugging: Stage-by-stage with custom hyperparameters:
+-------------------------------------------------------
+conda activate histotspn
+
+# Validate setup
+python smoke_test_biomedclip.py
+
+# Stage 0: ~2 min
+python train_classifier_real.py --epochs 2 --device cuda
+
+# Stage 1: ~5 min
+python train_tspn.py \
+  --classifier-checkpoint artifacts/classifier_real/classifier_checkpoint.pt \
+  --epochs 2 \
+  --device cuda
+
+# Test
+python test_model.py \
+  --tspn-checkpoint artifacts/tspn_distill/tspn_checkpoint.pt \
+  --classifier-checkpoint artifacts/classifier_real/classifier_checkpoint.pt \
+  --device cuda
+
+Production: Full training + evaluation:
+----------------------------------------
+conda activate histotspn
+python main.py train-full --data-root BCI_dataset --output-base artifacts --device cuda
+python test_model.py --final-checkpoint artifacts/final_stage/finetuned_pipeline_checkpoint.pt
+python verify_tspn.py --tspn-checkpoint artifacts/tspn_distill/tspn_checkpoint.pt --split validation
+
+================================================================================
+FEATURE EXTRACTION DEFAULTS
+================================================================================
+
+Patch extraction now targets ~64 patches per typical WSI:
+- Patch size:  512×512 pixels  (up from 256×256)
+- Stride:      512 pixels      (non-overlapping, up from 256)
+- Morphology:  7×7 kernel      (improved for larger patches)
+
+Expected patch counts (varies by WSI size and tissue fraction):
+- 4096×4096 WSI:  ~64 patches   (perfect alignment with n_seeds)
+- 8192×8192 WSI:  ~256 patches  (4× more for larger slides)
+- 2048×2048 WSI:  ~16 patches   (fewer, smaller slides)
+
+TSPN output: Fixed 64 synthetic IHC features per slide (aligns with patch count)
+
+================================================================================
+NOTES
+================================================================================
+
+1. BiomedCLIP model downloads on first run (~750MB)
+   Set HF_TOKEN in .env to avoid rate limits
+
+2. GPU memory: ~15GB for typical training
+   Reduce conch-batch-size if out of memory
+
+3. Dataset split:
+   - Train:      90% of paired IDs
+   - Validation: 10% of paired IDs (stratified by label, seed=42)
+   - Test:       Held-out BCI_dataset/*/test split
+
+4. Checkpoint structure:
+   - Stage 0 (classifier): includes config, model state, history
+   - Stage 1 (TSPN):       includes loss weights, n_seeds, config
+   - Stage 2 (finetuned):  includes tspn_state_dict + classifier_state_dict
+
+5. Default validation split is "validation" for stages 0-1
+   Use --eval-split test only for final analysis after model selection
+
+================================================================================

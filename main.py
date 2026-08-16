@@ -13,9 +13,10 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from tqdm import tqdm
+import hashlib
 
 from conditioned_classifier import DualBagClassifier
-from conch_runner import load_conch_model
+from biomed_runner import load_biomedclip_model
 from get_data import HistoTSPNDataLoader
 from get_patches import PatchRecord, QuPathPatchExtractor
 from tspn import TSPN
@@ -42,8 +43,8 @@ class FeaturePair:
 @dataclass(frozen=True)
 class PipelineConfig:
 	data_root: str = "BCI_dataset"
-	patch_size: int = 256
-	stride: int = 256
+	patch_size: int = 128
+	stride: int = 128
 	min_tissue_fraction: float = 0.5
 	conch_batch_size: int = 32
 	input_dim: int = 512
@@ -126,8 +127,8 @@ def build_patch_extractor(config: PipelineConfig) -> QuPathPatchExtractor:
 		patch_size=config.patch_size,
 		stride=config.stride,
 		min_tissue_fraction=config.min_tissue_fraction,
-		blur_kernel=5,
-		morph_kernel=5,
+		blur_kernel=7,
+		morph_kernel=7,
 	)
 
 
@@ -147,8 +148,8 @@ def encode_patch_records(
 
 	encoded_batches: List[torch.Tensor] = []
 	num_batches = (len(records) + batch_size - 1) // batch_size
-	# Encode each batch of patches through CONCH feature extractor
-	for start in tqdm(range(0, len(records), batch_size), total=num_batches, desc="  CONCH encoding", leave=False, unit="batch"):
+	# Encode each batch of patches through the active feature extractor
+	for start in tqdm(range(0, len(records), batch_size), total=num_batches, desc="  feature encoding", leave=False, unit="batch"):
 		batch_records = records[start : start + batch_size]
 		batch_images = [preprocess(Image.fromarray(record.patch).convert("RGB")) for record in batch_records]
 		batch_tensor = torch.stack(batch_images, dim=0).to(device)
@@ -160,40 +161,75 @@ def encode_patch_records(
 
 	return torch.cat(encoded_batches, dim=0)
 
+def _feature_cache_path(cache_root: Path, image_id: str, modality: str) -> Path:
+    """Returns a stable per-slide cache path."""
+    return cache_root / modality / f"{image_id}.pt"
+
+
+def _config_hash(patch_size: int, stride: int, min_tissue_fraction: float) -> str:
+    """Short hash of patch extraction config — cache is invalidated if these change."""
+    key = f"{patch_size}_{stride}_{min_tissue_fraction}"
+    return hashlib.md5(key.encode()).hexdigest()[:8]
+
 
 def build_feature_pairs(
-	samples: Sequence[PairedWSISample],
-	extractor: QuPathPatchExtractor,
-	model: torch.nn.Module,
-	preprocess,
-	device: torch.device,
-	batch_size: int,
+    samples: Sequence[PairedWSISample],
+    extractor: QuPathPatchExtractor,
+    model: torch.nn.Module,
+    preprocess,
+    device: torch.device,
+    batch_size: int,
+    cache_root: Path | None = None,          # new — pass None to disable caching
 ) -> List[FeaturePair]:
-	feature_pairs: List[FeaturePair] = []
+    feature_pairs: List[FeaturePair] = []
 
-	# Outer loop: patch extraction + CONCH encoding per WSI pair
-	for sample in tqdm(samples, desc="[Stage] Building feature pairs (patch → CONCH)", unit="WSI"):
-		he_records = extract_patch_records(sample.he_image, sample.label, f"{sample.image_id}_HE", extractor)
-		ihc_records = extract_patch_records(sample.ihc_image, sample.label, f"{sample.image_id}_IHC", extractor)
+    for sample in tqdm(samples, desc="[Stage] Building feature pairs (patch → feature)", unit="WSI"):
 
-		# Encode H&E patches
-		tqdm.write(f"  [{sample.image_id}] H&E: {len(he_records)} patches | IHC: {len(ihc_records)} patches")
-		he_features = encode_patch_records(he_records, model, preprocess, device, batch_size)
-		# Encode IHC patches
-		ihc_features = encode_patch_records(ihc_records, model, preprocess, device, batch_size)
+        # ── cache lookup ──────────────────────────────────────────────────
+        if cache_root is not None:
+            he_cache  = _feature_cache_path(cache_root, f"{sample.image_id}_HE",  "he")
+            ihc_cache = _feature_cache_path(cache_root, f"{sample.image_id}_IHC", "ihc")
+            he_cache.parent.mkdir(parents=True, exist_ok=True)
+            ihc_cache.parent.mkdir(parents=True, exist_ok=True)
 
-		feature_pairs.append(
-			FeaturePair(
-				image_id=sample.image_id,
-				label=sample.label,
-				he_features=he_features,
-				ihc_features=ihc_features,
-				he_patch_count=len(he_records),
-				ihc_patch_count=len(ihc_records),
-			)
-		)
+            if he_cache.exists() and ihc_cache.exists():
+                tqdm.write(f"  [{sample.image_id}] cache hit — skipping encoding")
+                he_features  = torch.load(he_cache,  map_location="cpu")
+                ihc_features = torch.load(ihc_cache, map_location="cpu")
+                feature_pairs.append(FeaturePair(
+                    image_id=sample.image_id,
+                    label=sample.label,
+                    he_features=he_features,
+                    ihc_features=ihc_features,
+                    he_patch_count=he_features.shape[0],
+                    ihc_patch_count=ihc_features.shape[0],
+                ))
+                continue
 
-	return feature_pairs
+        # ── encode from scratch ───────────────────────────────────────────
+        he_records  = extract_patch_records(sample.he_image,  sample.label, f"{sample.image_id}_HE",  extractor)
+        ihc_records = extract_patch_records(sample.ihc_image, sample.label, f"{sample.image_id}_IHC", extractor)
+
+        tqdm.write(f"  [{sample.image_id}] H&E: {len(he_records)} patches | IHC: {len(ihc_records)} patches")
+        he_features  = encode_patch_records(he_records,  model, preprocess, device, batch_size)
+        ihc_features = encode_patch_records(ihc_records, model, preprocess, device, batch_size)
+
+        # ── save to cache ─────────────────────────────────────────────────
+        if cache_root is not None:
+            torch.save(he_features,  he_cache)
+            torch.save(ihc_features, ihc_cache)
+            tqdm.write(f"  [{sample.image_id}] cached to {cache_root}")
+
+        feature_pairs.append(FeaturePair(
+            image_id=sample.image_id,
+            label=sample.label,
+            he_features=he_features,
+            ihc_features=ihc_features,
+            he_patch_count=len(he_records),
+            ihc_patch_count=len(ihc_records),
+        ))
+
+    return feature_pairs
 
 
 def build_tspn_model(config: PipelineConfig, device: torch.device) -> TSPN:
@@ -368,8 +404,8 @@ def parse_args() -> argparse.Namespace:
 	prepare_parser.add_argument("--data-root", type=str, default="BCI_dataset")
 	prepare_parser.add_argument("--split", type=str, default="train", choices=("train", "validation", "test"))
 	prepare_parser.add_argument("--output-dir", type=str, default="artifacts/pipeline")
-	prepare_parser.add_argument("--patch-size", type=int, default=256)
-	prepare_parser.add_argument("--stride", type=int, default=256)
+	prepare_parser.add_argument("--patch-size", type=int, default=512)
+	prepare_parser.add_argument("--stride", type=int, default=512)
 	prepare_parser.add_argument("--min-tissue-fraction", type=float, default=0.5)
 	prepare_parser.add_argument("--conch-batch-size", type=int, default=32)
 	prepare_parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -384,8 +420,8 @@ def parse_args() -> argparse.Namespace:
 	tspn_parser.add_argument("--data-root", type=str, default="BCI_dataset")
 	tspn_parser.add_argument("--split", type=str, default="test", choices=("train", "validation", "test"))
 	tspn_parser.add_argument("--output-dir", type=str, default="artifacts/pipeline")
-	tspn_parser.add_argument("--patch-size", type=int, default=256)
-	tspn_parser.add_argument("--stride", type=int, default=256)
+	tspn_parser.add_argument("--patch-size", type=int, default=512)
+	tspn_parser.add_argument("--stride", type=int, default=512)
 	tspn_parser.add_argument("--min-tissue-fraction", type=float, default=0.5)
 	tspn_parser.add_argument("--conch-batch-size", type=int, default=32)
 	tspn_parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -396,8 +432,8 @@ def parse_args() -> argparse.Namespace:
 	complete_parser.add_argument("--data-root", type=str, default="BCI_dataset")
 	complete_parser.add_argument("--split", type=str, default="test", choices=("train", "validation", "test"))
 	complete_parser.add_argument("--output-dir", type=str, default="artifacts/pipeline")
-	complete_parser.add_argument("--patch-size", type=int, default=256)
-	complete_parser.add_argument("--stride", type=int, default=256)
+	complete_parser.add_argument("--patch-size", type=int, default=512)
+	complete_parser.add_argument("--stride", type=int, default=512)
 	complete_parser.add_argument("--min-tissue-fraction", type=float, default=0.5)
 	complete_parser.add_argument("--conch-batch-size", type=int, default=32)
 	complete_parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -405,8 +441,8 @@ def parse_args() -> argparse.Namespace:
 	train_full_parser = subparsers.add_parser("train-full", help="Run Stage 0, Stage 1 distillation, and Stage 2 fine-tuning")
 	train_full_parser.add_argument("--data-root", type=str, default="BCI_dataset")
 	train_full_parser.add_argument("--output-base", type=str, default="artifacts")
-	train_full_parser.add_argument("--patch-size", type=int, default=256)
-	train_full_parser.add_argument("--stride", type=int, default=256)
+	train_full_parser.add_argument("--patch-size", type=int, default=512)
+	train_full_parser.add_argument("--stride", type=int, default=512)
 	train_full_parser.add_argument("--min-tissue-fraction", type=float, default=0.5)
 	train_full_parser.add_argument("--conch-batch-size", type=int, default=32)
 	train_full_parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -449,28 +485,37 @@ def sanity_check(he_dim=512, n_seeds=64, n_classes=4):
 
 
 def _prepare_feature_pairs(args: argparse.Namespace) -> Tuple[PipelineConfig, List[FeaturePair]]:
-	config = PipelineConfig(
-		data_root=args.data_root,
-		patch_size=args.patch_size,
-		stride=args.stride,
-		min_tissue_fraction=args.min_tissue_fraction,
-		conch_batch_size=args.conch_batch_size,
-	)
-	device = torch.device(args.device)
+    config = PipelineConfig(
+        data_root=args.data_root,
+        patch_size=args.patch_size,
+        stride=args.stride,
+        min_tissue_fraction=args.min_tissue_fraction,
+        conch_batch_size=args.conch_batch_size,
+    )
+    device = torch.device(args.device)
 
-	# Load CONCH model (downloads weights on first run)
-	tqdm.write("[Prepare] Loading CONCH feature extractor...")
-	conch_model, preprocess = load_conch_model()
-	conch_model = conch_model.to(device)
-	conch_model.eval()
+    # cache root is keyed by patch config so stale caches are never silently reused
+    cfg_hash  = _config_hash(args.patch_size, args.stride, args.min_tissue_fraction)
+    split     = getattr(args, "split", "train")
+    cache_root = Path("feature_cache") / cfg_hash / split
 
-	tqdm.write(f"[Prepare] Loading paired WSI samples from '{config.data_root}' ({args.split} split)...")
-	samples = load_paired_wsi_samples(config.data_root, args.split)
-	tqdm.write(f"[Prepare] Found {len(samples)} paired HE/IHC samples")
-	extractor = build_patch_extractor(config)
-	feature_pairs = build_feature_pairs(samples, extractor, conch_model, preprocess, device, config.conch_batch_size)
+    tqdm.write(f"[Prepare] Feature cache: {cache_root}")
+    tqdm.write("[Prepare] Loading BiomedCLIP feature extractor...")
+    feature_model, preprocess, _ = load_biomedclip_model()
+    feature_model = feature_model.to(device).eval()
 
-	return config, feature_pairs
+    tqdm.write(f"[Prepare] Loading paired WSI samples from '{config.data_root}' ({split} split)...")
+    samples = load_paired_wsi_samples(config.data_root, split)
+    tqdm.write(f"[Prepare] Found {len(samples)} paired HE/IHC samples")
+
+    extractor     = build_patch_extractor(config)
+    feature_pairs = build_feature_pairs(
+        samples, extractor, feature_model, preprocess,
+        device, config.conch_batch_size,
+        cache_root=cache_root,              # ← caching enabled
+    )
+
+    return config, feature_pairs
 
 
 def _run_prepare(args: argparse.Namespace) -> None:

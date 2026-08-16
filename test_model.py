@@ -17,7 +17,7 @@ from main import (
 	build_patch_extractor,
 	load_paired_wsi_samples,
 )
-from conch_runner import load_conch_model
+from biomed_runner import load_biomedclip_model
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -30,8 +30,8 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--tspn-checkpoint", type=str, default=None)
 	parser.add_argument("--classifier-checkpoint", type=str, default=None)
 	parser.add_argument("--output-dir", type=str, default="validation_outputs")
-	parser.add_argument("--patch-size", type=int, default=256)
-	parser.add_argument("--stride", type=int, default=256)
+	parser.add_argument("--patch-size", type=int, default=512)
+	parser.add_argument("--stride", type=int, default=512)
 	parser.add_argument("--min-tissue-fraction", type=float, default=0.5)
 	parser.add_argument("--conch-batch-size", type=int, default=32)
 	parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -185,13 +185,13 @@ def main() -> None:
 	print(f"Using checkpoint(s): {checkpoint_label}")
 
 	pipeline, config = load_pipeline(args, device, final_checkpoint, tspn_checkpoint, classifier_checkpoint)
-	conch_model, preprocess = load_conch_model()
-	conch_model = conch_model.to(device).eval()
+	feature_model, preprocess = load_biomedclip_model()
+	feature_model = feature_model.to(device).eval()
 	samples = load_paired_wsi_samples(config.data_root, "test")
 	feature_pairs = build_feature_pairs(
 		samples,
 		build_patch_extractor(config),
-		conch_model,
+		feature_model,
 		preprocess,
 		device,
 		config.conch_batch_size,

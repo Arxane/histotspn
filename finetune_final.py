@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from conch_runner import load_conch_model
+from biomed_runner import load_biomedclip_model
 from main import (
     PipelineConfig,
     build_complete_pipeline,
@@ -32,8 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tspn-checkpoint", type=str, required=True)
     parser.add_argument("--classifier-checkpoint", type=str, required=True)
     parser.add_argument("--output-dir", type=str, default="artifacts/final_stage")
-    parser.add_argument("--patch-size", type=int, default=256)
-    parser.add_argument("--stride", type=int, default=256)
+    parser.add_argument("--patch-size", type=int, default=128)
+    parser.add_argument("--stride", type=int, default=128)
     parser.add_argument("--min-tissue-fraction", type=float, default=0.5)
     parser.add_argument("--conch-batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=5)
@@ -58,11 +58,11 @@ def build_feature_pairs_for_split(args, split):
         classifier_layers=args.classifier_layers,
     )
     device = torch.device(args.device)
-    conch_model, preprocess = load_conch_model()
-    conch_model = conch_model.to(device).eval()
+    feature_model, preprocess = load_biomedclip_model()
+    feature_model = feature_model.to(device).eval()
     samples = load_paired_wsi_samples(config.data_root, split)
     pairs = build_feature_pairs(
-        samples, build_patch_extractor(config), conch_model, preprocess, device, config.conch_batch_size
+        samples, build_patch_extractor(config), feature_model, preprocess, device, config.conch_batch_size
     )
     return config, pairs
 

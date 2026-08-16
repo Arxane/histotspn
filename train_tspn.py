@@ -19,7 +19,9 @@ from main import (
     load_state_dict,
 )
 from tspn import tspn_distribution_loss
-from conch_runner import load_conch_model
+from biomed_runner import load_biomedclip_model
+
+import hashlib
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,8 +31,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--classifier-checkpoint", type=str, required=True)
     parser.add_argument("--tspn-checkpoint", type=str, default=None)
     parser.add_argument("--eval-split", type=str, default="validation", choices=("validation", "test"))
-    parser.add_argument("--patch-size", type=int, default=256)
-    parser.add_argument("--stride", type=int, default=256)
+    parser.add_argument("--patch-size", type=int, default=128)
+    parser.add_argument("--stride", type=int, default=128)
     parser.add_argument("--min-tissue-fraction", type=float, default=0.5)
     parser.add_argument("--conch-batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=5)
@@ -68,16 +70,21 @@ def build_pairs(args, split, device):
         dim_feedforward=args.dim_feedforward,
         dropout=args.dropout,
     )
-    conch_model, preprocess = load_conch_model()
-    conch_model = conch_model.to(device).eval()
+    feature_model, preprocess, _ = load_biomedclip_model()
+    feature_model = feature_model.to(device).eval()
     samples = load_paired_wsi_samples(args.data_root, split)
+    cfg_hash   = hashlib.md5(
+        f"{args.patch_size}_{args.stride}_{args.min_tissue_fraction}".encode()
+    ).hexdigest()[:8]
+    cache_root = Path("feature_cache") / cfg_hash / split
     pairs = build_feature_pairs(
         samples,
         build_patch_extractor(config),
-        conch_model,
+        feature_model,
         preprocess,
         device,
         config.conch_batch_size,
+        cache_root=cache_root,
     )
     return config, pairs
 
