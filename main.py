@@ -62,6 +62,8 @@ class PipelineConfig:
 	classifier_layers: int = 2
 	classifier_hidden: int = 256
 	num_classes: int = 4
+	lmf_rank: int = 16
+	lmf_output_dim: int | None = None
 
 
 class CompleteHistologyPipeline(nn.Module):
@@ -166,9 +168,20 @@ def _feature_cache_path(cache_root: Path, image_id: str, modality: str) -> Path:
     return cache_root / modality / f"{image_id}.pt"
 
 
-def _config_hash(patch_size: int, stride: int, min_tissue_fraction: float) -> str:
-    """Short hash of patch extraction config — cache is invalidated if these change."""
-    key = f"{patch_size}_{stride}_{min_tissue_fraction}"
+def _config_hash(
+    patch_size: int,
+    stride: int,
+    min_tissue_fraction: float,
+    normalize_features: bool = True,
+) -> str:
+    """Stable hash for patch extraction and feature representation config."""
+    key = (
+        f"biomedclip_v1_"
+        f"{patch_size}_"
+        f"{stride}_"
+        f"{min_tissue_fraction}_"
+        f"norm_{normalize_features}"
+    )
     return hashlib.md5(key.encode()).hexdigest()[:8]
 
 
@@ -179,55 +192,169 @@ def build_feature_pairs(
     preprocess,
     device: torch.device,
     batch_size: int,
-    cache_root: Path | None = None,          # new — pass None to disable caching
+    cache_root: Path | None = None,
+    normalize_features: bool = True,
 ) -> List[FeaturePair]:
+
     feature_pairs: List[FeaturePair] = []
 
-    for sample in tqdm(samples, desc="[Stage] Building feature pairs (patch → feature)", unit="WSI"):
-
-        # ── cache lookup ──────────────────────────────────────────────────
+    for sample in tqdm(
+        samples,
+        desc="[Stage] Building feature pairs (patch → feature)",
+        unit="WSI",
+    ):
+        # ------------------------------------------------------------------
+        # Cache lookup
+        # ------------------------------------------------------------------
         if cache_root is not None:
-            he_cache  = _feature_cache_path(cache_root, f"{sample.image_id}_HE",  "he")
-            ihc_cache = _feature_cache_path(cache_root, f"{sample.image_id}_IHC", "ihc")
-            he_cache.parent.mkdir(parents=True, exist_ok=True)
-            ihc_cache.parent.mkdir(parents=True, exist_ok=True)
+            he_cache = _feature_cache_path(
+                cache_root,
+                f"{sample.image_id}_HE",
+                "he",
+            )
+
+            ihc_cache = _feature_cache_path(
+                cache_root,
+                f"{sample.image_id}_IHC",
+                "ihc",
+            )
+
+            he_cache.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            ihc_cache.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
 
             if he_cache.exists() and ihc_cache.exists():
-                tqdm.write(f"  [{sample.image_id}] cache hit — skipping encoding")
-                he_features  = torch.load(he_cache,  map_location="cpu")
-                ihc_features = torch.load(ihc_cache, map_location="cpu")
-                feature_pairs.append(FeaturePair(
-                    image_id=sample.image_id,
-                    label=sample.label,
-                    he_features=he_features,
-                    ihc_features=ihc_features,
-                    he_patch_count=he_features.shape[0],
-                    ihc_patch_count=ihc_features.shape[0],
-                ))
+                tqdm.write(
+                    f"  [{sample.image_id}] "
+                    f"cache hit — skipping encoding"
+                )
+
+                he_features = torch.load(
+                    he_cache,
+                    map_location="cpu",
+                )
+
+                ihc_features = torch.load(
+                    ihc_cache,
+                    map_location="cpu",
+                )
+
+                # Make the representation invariant to whether the
+                # encoder itself returned normalized features.
+                if normalize_features:
+                    he_features = torch.nn.functional.normalize(
+                        he_features,
+                        dim=-1,
+                    )
+
+                    ihc_features = torch.nn.functional.normalize(
+                        ihc_features,
+                        dim=-1,
+                    )
+
+                feature_pairs.append(
+                    FeaturePair(
+                        image_id=sample.image_id,
+                        label=sample.label,
+                        he_features=he_features,
+                        ihc_features=ihc_features,
+                        he_patch_count=he_features.shape[0],
+                        ihc_patch_count=ihc_features.shape[0],
+                    )
+                )
+
                 continue
 
-        # ── encode from scratch ───────────────────────────────────────────
-        he_records  = extract_patch_records(sample.he_image,  sample.label, f"{sample.image_id}_HE",  extractor)
-        ihc_records = extract_patch_records(sample.ihc_image, sample.label, f"{sample.image_id}_IHC", extractor)
+        # ------------------------------------------------------------------
+        # Encode from scratch
+        # ------------------------------------------------------------------
 
-        tqdm.write(f"  [{sample.image_id}] H&E: {len(he_records)} patches | IHC: {len(ihc_records)} patches")
-        he_features  = encode_patch_records(he_records,  model, preprocess, device, batch_size)
-        ihc_features = encode_patch_records(ihc_records, model, preprocess, device, batch_size)
+        he_records = extract_patch_records(
+            sample.he_image,
+            sample.label,
+            f"{sample.image_id}_HE",
+            extractor,
+        )
 
-        # ── save to cache ─────────────────────────────────────────────────
+        ihc_records = extract_patch_records(
+            sample.ihc_image,
+            sample.label,
+            f"{sample.image_id}_IHC",
+            extractor,
+        )
+
+        tqdm.write(
+            f"  [{sample.image_id}] "
+            f"H&E: {len(he_records)} patches | "
+            f"IHC: {len(ihc_records)} patches"
+        )
+
+        he_features = encode_patch_records(
+            he_records,
+            model,
+            preprocess,
+            device,
+            batch_size,
+        )
+
+        ihc_features = encode_patch_records(
+            ihc_records,
+            model,
+            preprocess,
+            device,
+            batch_size,
+        )
+
+        # ------------------------------------------------------------------
+        # Explicit L2 normalization
+        # ------------------------------------------------------------------
+
+        if normalize_features:
+            he_features = torch.nn.functional.normalize(
+                he_features,
+                dim=-1,
+            )
+
+            ihc_features = torch.nn.functional.normalize(
+                ihc_features,
+                dim=-1,
+            )
+
+        # ------------------------------------------------------------------
+        # Save normalized representation
+        # ------------------------------------------------------------------
+
         if cache_root is not None:
-            torch.save(he_features,  he_cache)
-            torch.save(ihc_features, ihc_cache)
-            tqdm.write(f"  [{sample.image_id}] cached to {cache_root}")
+            torch.save(
+                he_features,
+                he_cache,
+            )
 
-        feature_pairs.append(FeaturePair(
-            image_id=sample.image_id,
-            label=sample.label,
-            he_features=he_features,
-            ihc_features=ihc_features,
-            he_patch_count=len(he_records),
-            ihc_patch_count=len(ihc_records),
-        ))
+            torch.save(
+                ihc_features,
+                ihc_cache,
+            )
+
+            tqdm.write(
+                f"  [{sample.image_id}] "
+                f"cached to {cache_root}"
+            )
+
+        feature_pairs.append(
+            FeaturePair(
+                image_id=sample.image_id,
+                label=sample.label,
+                he_features=he_features,
+                ihc_features=ihc_features,
+                he_patch_count=len(he_records),
+                ihc_patch_count=len(ihc_records),
+            )
+        )
 
     return feature_pairs
 
@@ -256,6 +383,8 @@ def build_conditioned_classifier(config: PipelineConfig, device: torch.device) -
 		mlp_hidden=config.classifier_hidden,
 		num_classes=config.num_classes,
 		dropout=config.dropout,
+		lmf_rank=config.lmf_rank,
+        lmf_output_dim=config.lmf_output_dim,
 	).to(device)
 
 
@@ -346,6 +475,57 @@ def load_tspn_config_from_checkpoint(checkpoint_path: Path, base_config: Pipelin
 
 	base_fields = {f: getattr(base_config, f) for f in base_config.__dataclass_fields__}
 	return PipelineConfig(**{**base_fields, **overrides})
+
+def load_classifier_config_from_checkpoint(
+    checkpoint_path: Path,
+    base_config: PipelineConfig,
+) -> PipelineConfig:
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+    )
+
+    saved = checkpoint.get("config", {})
+
+    classifier_field_map = {
+        "classifier_dim": "classifier_dim",
+        "classifier_heads": "classifier_heads",
+        "classifier_layers": "classifier_layers",
+        "classifier_hidden": "classifier_hidden",
+        "num_classes": "num_classes",
+        "dropout": "dropout",
+        "lmf_rank": "lmf_rank",
+        "lmf_output_dim": "lmf_output_dim",
+    }
+
+    overrides = {
+        dst: saved[src]
+        for src, dst in classifier_field_map.items()
+        if src in saved
+    }
+
+    if overrides:
+        tqdm.write(
+            "[Config] Classifier architecture loaded from checkpoint: "
+            f"{overrides}"
+        )
+    else:
+        tqdm.write(
+            "[Config] Warning: no classifier architecture config "
+            "in checkpoint — using PipelineConfig defaults"
+        )
+
+    base_fields = {
+        f: getattr(base_config, f)
+        for f in base_config.__dataclass_fields__
+    }
+
+    return PipelineConfig(
+        **{
+            **base_fields,
+            **overrides,
+        }
+    )
 
 
 @torch.no_grad()
@@ -451,6 +631,10 @@ def parse_args() -> argparse.Namespace:
 	train_full_parser.add_argument("--epochs-stage3", type=int, default=5, help="Epochs for Stage 2 joint fine-tuning")
 	train_full_parser.add_argument("--num-decoder-layers", type=int, default=3, help="TSPN Transformer decoder layers")
 	train_full_parser.add_argument("--classifier-layers", type=int, default=2, help="Conditioned classifier cross-attention layers")
+	train_full_parser.add_argument("--classifier-dim",type=int,default=512,)
+	train_full_parser.add_argument("--classifier-hidden",type=int,default=256,)
+	train_full_parser.add_argument("--lmf-rank",type=int,default=16,)
+	train_full_parser.add_argument("--lmf-output-dim",type=int,default=None,)
 	train_full_parser.add_argument("--alpha", type=float, default=1.0)
 	train_full_parser.add_argument("--beta", type=float, default=0.5)
 	train_full_parser.add_argument("--gamma", type=float, default=0.3)
@@ -476,8 +660,11 @@ def sanity_check(he_dim=512, n_seeds=64, n_classes=4):
 		num_layers=2,
 		mlp_hidden=256,
 		num_classes=n_classes,
+		lmf_rank=16,
+		lmf_output_dim=he_dim,
 	)
 	syn_ihc = tspn(he_patches)
+	assert (classifier.aggregator.lmf.out_factor.shape == (16, he_dim)), ("Unexpected LMF output factor shape: " f"{classifier.aggregator.lmf.out_factor.shape}")
 	assert syn_ihc.shape == (n_seeds, he_dim), f"TSPN output shape wrong: {syn_ihc.shape}"
 	logits = classifier(he_patches, syn_ihc)
 	assert logits.shape == (n_classes,), f"Classifier output shape wrong: {logits.shape}"
@@ -495,7 +682,7 @@ def _prepare_feature_pairs(args: argparse.Namespace) -> Tuple[PipelineConfig, Li
     device = torch.device(args.device)
 
     # cache root is keyed by patch config so stale caches are never silently reused
-    cfg_hash  = _config_hash(args.patch_size, args.stride, args.min_tissue_fraction)
+    cfg_hash  = _config_hash(args.patch_size, args.stride, args.min_tissue_fraction, normalize_features=True)
     split     = getattr(args, "split", "train")
     cache_root = Path("feature_cache") / cfg_hash / split
 
@@ -552,6 +739,7 @@ def _run_export_complete(args: argparse.Namespace) -> None:
 	device = torch.device(args.device)
 
 	config = load_tspn_config_from_checkpoint(Path(args.tspn_checkpoint), config)
+	config = load_classifier_config_from_checkpoint(Path(args.classifier_checkpoint),config,)
 	pipeline = build_complete_pipeline(config, device)
 	load_state_dict(pipeline.tspn, Path(args.tspn_checkpoint), device)
 	load_state_dict(pipeline.classifier, Path(args.classifier_checkpoint), device)
@@ -705,6 +893,10 @@ def _run_distillation_protocol(args: argparse.Namespace) -> None:
 		"--min-tissue-fraction", str(args.min_tissue_fraction),
 		"--conch-batch-size", str(args.conch_batch_size), "--device", args.device,
 		"--epochs", str(args.epochs_stage2), "--classifier-layers", str(args.classifier_layers),
+		"--classifier-dim", str(args.classifier_dim),"--classifier-hidden",str(args.classifier_hidden),
+		"--lmf-rank",str(args.lmf_rank),"--lmf-output-dim",str(args.lmf_output_dim)
+		if args.lmf_output_dim is not None
+		else "512",
 		"--learning-rate", str(args.learning_rate), "--weight-decay", str(args.weight_decay),
 	]
 	print("STAGE 0/3: Training classifier on real HE + real IHC")

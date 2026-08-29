@@ -21,7 +21,7 @@ from main import (
     load_tspn_config_from_checkpoint,
     unfreeze_module,
 )
-from tspn import mmd_loss
+from tspn import {mmd_loss, swd_loss, moment_matching_loss, tspn_joint_loss}
 import hashlib
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +45,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--classification-weight", type=float, default=1.0)
     parser.add_argument("--mmd-weight", type=float, default=0.1)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--classification-weight",
+        type=float,
+        default=1.0,
+    )
+
+    parser.add_argument(
+        "--mmd-weight",
+        type=float,
+        default=0.1,
+    )
+
+    parser.add_argument(
+        "--swd-weight",
+        type=float,
+        default=0.1,
+    )
+
+    parser.add_argument(
+        "--moment-weight",
+        type=float,
+        default=0.05,
+    )
     return parser.parse_args()
 
 
@@ -71,10 +94,10 @@ def build_feature_pairs_for_split(args, split):
     return config, pairs
 
 
-def run_epoch(model, feature_pairs, optimizer, device, classification_weight, mmd_weight, training):
+def run_epoch(model, feature_pairs, optimizer, device, classification_weight, mmd_weight, swd_weight, moment_weight, training):
     model.tspn.train(training)
     model.classifier.train(training)
-    totals = {"loss": 0.0, "classification": 0.0, "mmd": 0.0}
+    totals = {"loss": 0.0, "classification": 0.0, "mmd": 0.0, "swd": 0.0, "moment": 0.0}
     correct = 0
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
@@ -85,16 +108,28 @@ def run_epoch(model, feature_pairs, optimizer, device, classification_weight, mm
             real_ihc = pair.ihc_features.to(device)
             label = torch.tensor([pair.label], device=device, dtype=torch.long)
             synthetic_ihc = model.tspn(he)
-            logits = model.classifier(he, synthetic_ihc)
-            classification = F.cross_entropy(logits.unsqueeze(0), label)
-            distribution = mmd_loss(synthetic_ihc, real_ihc)
-            loss = classification_weight * classification + mmd_weight * distribution
+            logits = model.classifier(he,synthetic_ihc,)
+            classification = F.cross_entropy(logits.unsqueeze(0),label,)
+            mmd = mmd_loss(synthetic_ihc,real_ihc,)
+            swd = sliced_wasserstein(synthetic_ihc,real_ihc,)
+            moment = moment_matching_loss(synthetic_ihc,real_ihc,)
+
+            loss = (
+                classification_weight * classification
+                + mmd_weight * mmd
+                + swd_weight * swd
+                + moment_weight * moment
+            )
             if training:
                 loss.backward()
                 optimizer.step()
             totals["loss"] += float(loss.item())
-            totals["classification"] += float(classification.item())
-            totals["mmd"] += float(distribution.item())
+            totals["classification"] += float(
+                classification.item()
+            )
+            totals["mmd"] += float(mmd.item())
+            totals["swd"] += float(swd.item())
+            totals["moment"] += float(moment.item())
             correct += int(logits.argmax().item() == pair.label)
     count = max(len(feature_pairs), 1)
     return {key: value / count for key, value in totals.items()}, correct / count

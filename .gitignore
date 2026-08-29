@@ -9,5 +9,6 @@ artifacts/
 pre_distill/
 distill_method/
 distill_fail/
-artifacts_biomed/
+artifacts_biomed_concat/
 feature_cache/
+validation_outputs/

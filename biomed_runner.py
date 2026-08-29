@@ -122,11 +122,11 @@ class _FeatureExtractorWrapper(torch.nn.Module):
         self.model.train(mode)
         return self
 
-    def encode_image(self, images, proj_contrast=False, normalize=False):
+    def encode_image(self, images, proj_contrast=False, normalize=True):
         del proj_contrast, normalize
         return self.model.encode_image(images)
 
-    def forward(self, images, proj_contrast=False, normalize=False):
+    def forward(self, images, proj_contrast=False, normalize=True):
         return self.encode_image(images, proj_contrast=proj_contrast, normalize=normalize)
 
 
@@ -183,7 +183,7 @@ def encode_biomedclip_image(
     image = Image.open(image_path).convert("RGB")
     image_tensor = preprocess(image).unsqueeze(0).to(dev)
     with torch.inference_mode():
-        emb = model.encode_image(image_tensor, normalize=False)
+        emb = model.encode_image(image_tensor, normalize=True)
     return emb.cpu()
 
 
@@ -216,7 +216,7 @@ def encode_biomedclip_images(
         if flush:
             batch = torch.stack(batch_tensors).to(dev)   # (B, C, H, W)
             with torch.inference_mode():
-                embs = model.encode_image(batch, normalize=False)
+                embs = model.encode_image(batch, normalize=True)
             all_embeddings.append(embs.cpu())
             batch_tensors = []
 
