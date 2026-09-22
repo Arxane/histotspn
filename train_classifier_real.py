@@ -12,21 +12,13 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from biomed_runner import load_biomedclip_model
-from main import (
-    PipelineConfig,
-    build_conditioned_classifier,
-    build_feature_pairs,
-    build_patch_extractor,
-    load_paired_wsi_samples,
-)
+from main import PipelineConfig, build_conditioned_classifier, build_feature_pairs, build_patch_extractor, load_paired_wsi_samples
 
 import hashlib
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Stage 0: train the classifier on real HE + real IHC features."
-    )
+    parser = argparse.ArgumentParser(description="Stage 0: train the classifier on real HE + real IHC features.")
     parser.add_argument("--data-root", default="BCI_dataset")
     parser.add_argument("--eval-split", choices=("validation", "test"), default="validation")
     parser.add_argument("--output-dir", default="artifacts/classifier_real")
@@ -57,19 +49,9 @@ def build_pairs(args: argparse.Namespace, split: str, device: torch.device):
     feature_model, preprocess, _ = load_biomedclip_model()
     feature_model = feature_model.to(device).eval()
     samples = load_paired_wsi_samples(args.data_root, split)
-    cfg_hash   = hashlib.md5(
-        f"{args.patch_size}_{args.stride}_{args.min_tissue_fraction}".encode()
-    ).hexdigest()[:8]
+    cfg_hash = hashlib.md5(f"{args.patch_size}_{args.stride}_{args.min_tissue_fraction}".encode()).hexdigest()[:8]
     cache_root = Path("feature_cache") / cfg_hash / split
-    pairs = build_feature_pairs(
-        samples,
-        build_patch_extractor(config),
-        feature_model,
-        preprocess,
-        device,
-        config.conch_batch_size,
-        cache_root=cache_root,
-    )
+    pairs = build_feature_pairs(samples, build_patch_extractor(config), feature_model, preprocess, device, config.conch_batch_size, cache_root=cache_root)
     return config, pairs
 
 
@@ -115,13 +97,7 @@ def main() -> None:
     for epoch in tqdm(range(1, args.epochs + 1), desc="Stage 0 epochs", unit="epoch"):
         train_loss, train_acc = run_epoch(model, train_pairs, optimizer, criterion, device, True)
         eval_loss, eval_acc = run_epoch(model, eval_pairs, optimizer, criterion, device, False)
-        history.append({
-            "epoch": float(epoch),
-            "train_loss": train_loss,
-            "train_acc": train_acc,
-            "eval_loss": eval_loss,
-            "eval_acc": eval_acc,
-        })
+        history.append({"epoch": float(epoch), "train_loss": train_loss, "train_acc": train_acc, "eval_loss": eval_loss, "eval_acc": eval_acc})
         print(
             f"Epoch {epoch:03d} | train_loss={train_loss:.6f} | train_acc={train_acc:.4f} | "
             f"{args.eval_split}_loss={eval_loss:.6f} | {args.eval_split}_acc={eval_acc:.4f}"

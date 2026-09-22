@@ -19,11 +19,7 @@ _preprocess = None
 def load_conch_model():
     global _model, _preprocess
     if _model is None:
-        _model, _preprocess = create_model_from_pretrained(
-            "conch_ViT-B-16",
-            "hf_hub:MahmoodLab/conch",
-            hf_auth_token=hf_access_token,
-        )
+        _model, _preprocess = create_model_from_pretrained("conch_ViT-B-16", "hf_hub:MahmoodLab/conch", hf_auth_token=hf_access_token)
     return _model, _preprocess
 
 
@@ -58,10 +54,7 @@ if __name__ == "__main__":
     sample_image = Path("BCI_dataset/IHC/train/02946_train_0.png")
     embeddings = encode_conch_image(sample_image)
     print(f"Single image embedding shape: {embeddings.shape}")
-    
-    sample_images = [
-        Path("BCI_dataset/IHC/train/02946_train_0.png"),
-        Path("BCI_dataset/HE/train/02946_train_0.png"),
-    ]
+
+    sample_images = [Path("BCI_dataset/IHC/train/02946_train_0.png"), Path("BCI_dataset/HE/train/02946_train_0.png")]
     batch_embeddings = encode_conch_images(sample_images)
     print(f"Batch embeddings shape: {batch_embeddings.shape}")

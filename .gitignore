@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 venv/
 artifacts/
+artifacts_lmf/
 pre_distill/
 distill_method/
 distill_fail/

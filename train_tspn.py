@@ -73,19 +73,9 @@ def build_pairs(args, split, device):
     feature_model, preprocess, _ = load_biomedclip_model()
     feature_model = feature_model.to(device).eval()
     samples = load_paired_wsi_samples(args.data_root, split)
-    cfg_hash   = hashlib.md5(
-        f"{args.patch_size}_{args.stride}_{args.min_tissue_fraction}".encode()
-    ).hexdigest()[:8]
+    cfg_hash = hashlib.md5(f"{args.patch_size}_{args.stride}_{args.min_tissue_fraction}".encode()).hexdigest()[:8]
     cache_root = Path("feature_cache") / cfg_hash / split
-    pairs = build_feature_pairs(
-        samples,
-        build_patch_extractor(config),
-        feature_model,
-        preprocess,
-        device,
-        config.conch_batch_size,
-        cache_root=cache_root,
-    )
+    pairs = build_feature_pairs(samples, build_patch_extractor(config), feature_model, preprocess, device, config.conch_batch_size, cache_root=cache_root)
     return config, pairs
 
 
@@ -105,9 +95,17 @@ def run_epoch(model, classifier, pairs, optimizer, device, args, training):
             logits_real = classifier(he, real_ihc)
             logits_syn = classifier(he, syn_ihc)
             loss, components = tspn_distribution_loss(
-                syn_ihc, real_ihc, logits_syn, logits_real, label,
-                alpha=args.alpha, beta=args.beta, gamma=args.gamma,
-                delta=args.delta, eta=args.eta, temperature=args.temperature,
+                syn_ihc,
+                real_ihc,
+                logits_syn,
+                logits_real,
+                label,
+                alpha=args.alpha,
+                beta=args.beta,
+                gamma=args.gamma,
+                delta=args.delta,
+                eta=args.eta,
+                temperature=args.temperature,
             )
             if training:
                 loss.backward()
@@ -121,20 +119,20 @@ def run_epoch(model, classifier, pairs, optimizer, device, args, training):
 
 def save_checkpoint(model, optimizer, output_dir, epoch, best_val_loss, args, metrics):
     path = output_dir / "tspn_checkpoint.pt"
-    torch.save({
-        "tspn_state_dict": model.state_dict(),
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "epoch": epoch,
-        "best_val_loss": best_val_loss,
-        "loss_weights": {
-            "alpha": args.alpha, "beta": args.beta, "gamma": args.gamma,
-            "delta": args.delta, "eta": args.eta,
+    torch.save(
+        {
+            "tspn_state_dict": model.state_dict(),
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "epoch": epoch,
+            "best_val_loss": best_val_loss,
+            "loss_weights": {"alpha": args.alpha, "beta": args.beta, "gamma": args.gamma, "delta": args.delta, "eta": args.eta},
+            "n_seeds": args.n_seeds,
+            "config": vars(args),
+            "metrics": metrics,
         },
-        "n_seeds": args.n_seeds,
-        "config": vars(args),
-        "metrics": metrics,
-    }, path)
+        path,
+    )
     return path
 
 
@@ -166,8 +164,19 @@ def main():
         val_metrics = run_epoch(model, classifier, val_pairs, optimizer, device, args, False)
         record = {"epoch": epoch, **{f"train_{k}": v for k, v in train_metrics.items()}, **{f"val_{k}": v for k, v in val_metrics.items()}}
         history.append(record)
-        print("Epoch %03d | train loss %.5f | val loss %.5f | mmd %.5f | swd %.5f | mom %.5f | kl %.5f | task %.5f" % (
-            epoch, train_metrics["loss"], val_metrics["loss"], val_metrics["mmd"], val_metrics["swd"], val_metrics["mom"], val_metrics["kl"], val_metrics["task"]))
+        print(
+            "Epoch %03d | train loss %.5f | val loss %.5f | mmd %.5f | swd %.5f | mom %.5f | kl %.5f | task %.5f"
+            % (
+                epoch,
+                train_metrics["loss"],
+                val_metrics["loss"],
+                val_metrics["mmd"],
+                val_metrics["swd"],
+                val_metrics["mom"],
+                val_metrics["kl"],
+                val_metrics["task"],
+            )
+        )
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
             best_state = copy.deepcopy(model.state_dict())

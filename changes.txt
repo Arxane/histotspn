@@ -1,0 +1,185 @@
+HistoTSPN Pipeline Improvements and Retraining Plan
+====================================================
+
+Current diagnosis
+-----------------
+The final_concat ablation is underwhelming:
+
+- HE only: 91.54% (357/390)
+- HE + real IHC: 92.05% (359/390)
+- HE + synthetic IHC: 92.31% (360/390)
+- HE + random IHC: 91.54% (357/390)
+
+The final classifier appears to rely primarily on HE and largely ignore the IHC branch. The older artifacts_lmf run is a useful comparison because random IHC reduced accuracy to approximately 42%, showing that the IHC branch can matter when the classifier learns to use it.
+
+Problems to address
+-------------------
+
+1. IHC is not enforced during classifier training.
+   Stage 0 trains on real HE + real IHC, and Stage 2 trains on HE + synthetic IHC. Neither stage applies modality dropout or IHC corruption, so the classifier can learn an HE-only shortcut.
+
+2. Stage 2 checkpoint selection uses combined validation loss only.
+   The best loss checkpoint is not necessarily the checkpoint with the best synthetic-IHC ablation behavior.
+
+3. TSPN supervision is mostly distribution-level.
+   MMD, sliced Wasserstein, and moment matching do not guarantee that synthetic IHC retains class-discriminative information.
+
+4. Training is short.
+   The default Stage 1 and Stage 2 training lengths are only five epochs, which may be insufficient for stable distillation and fine-tuning.
+
+5. Feature-extraction settings must be consistent.
+   train_tspn.py defaults to patch size 64 and stride 64, while the other pipeline scripts use 128. All stages should explicitly use the same patch size, stride, tissue threshold, and feature normalization.
+
+6. Validation loss alone is not enough.
+   Every candidate checkpoint should be evaluated with HE-only, real-IHC, synthetic-IHC, and random-IHC conditions before selection.
+
+Recommended retraining protocol
+--------------------------------
+
+Use a new output root so existing artifacts are preserved:
+
+    artifacts/new_v2/
+
+Use these settings consistently in every stage:
+
+- patch size: 128
+- stride: 128
+- minimum tissue fraction: 0.5
+- normalized BiomedCLIP features: enabled
+- device: cuda
+
+Stage 0: retrain the real-IHC classifier
+----------------------------------------
+
+    cd /data/mayank_2023/histotspn
+
+    conda run -n histotspn python train_classifier_real.py \
+      --data-root BCI_dataset \
+      --output-dir artifacts/new_v2/classifier_real \
+      --eval-split validation \
+      --patch-size 128 \
+      --stride 128 \
+      --epochs 50 \
+      --early-stopping-patience 10 \
+      --learning-rate 1e-4 \
+      --weight-decay 1e-4 \
+      --device cuda
+
+Before proceeding, evaluate the Stage 0 classifier under these conditions:
+
+- HE only
+- HE + real IHC
+- HE + zero IHC
+- HE + random normalized IHC
+
+The real-IHC classifier should lose meaningful accuracy when IHC is randomized. If it does not, the classifier is already ignoring IHC and should not be used for TSPN distillation.
+
+Stage 1: train TSPN with stronger task supervision
+---------------------------------------------------
+
+    conda run -n histotspn python train_tspn.py \
+      --data-root BCI_dataset \
+      --classifier-checkpoint artifacts/new_v2/classifier_real/classifier_checkpoint.pt \
+      --output-dir artifacts/new_v2/tspn_distill \
+      --eval-split validation \
+      --patch-size 128 \
+      --stride 128 \
+      --epochs 30 \
+      --early-stopping-patience 8 \
+      --learning-rate 5e-5 \
+      --weight-decay 1e-4 \
+      --alpha 0.5 \
+      --beta 0.25 \
+      --gamma 0.1 \
+      --delta 4.0 \
+      --eta 1.0 \
+      --temperature 3.0 \
+      --n-seeds 64 \
+      --n-heads 8 \
+      --num-decoder-layers 3 \
+      --device cuda
+
+The suggested loss-weight changes reduce the relative emphasis on generic feature matching and increase classification and teacher-logit supervision.
+
+Stage 2: modify before retraining
+---------------------------------
+
+Modify finetune_final.py so each training epoch uses a mixture of conditions:
+
+- 25% HE + real IHC
+- 25% HE + synthetic IHC
+- 25% HE + zero IHC
+- 25% HE + random normalized IHC
+
+Add moderate IHC branch dropout, approximately 20% to 30%, so the classifier cannot depend exclusively on one modality.
+
+Add an explicit consistency objective:
+
+    L = classification loss
+        + synthetic/real logit consistency
+        + MMD(synthetic IHC, real IHC)
+        + SWD(synthetic IHC, real IHC)
+        + moment matching
+
+The synthetic and real IHC branches should receive comparable task supervision. Keep the classifier learning rate lower than the TSPN learning rate only if validation experiments support it; otherwise test both learning-rate orderings.
+
+Stage 2 starting command after the code changes
+------------------------------------------------
+
+    conda run -n histotspn python finetune_final.py \
+      --data-root BCI_dataset \
+      --tspn-checkpoint artifacts/new_v2/tspn_distill/tspn_checkpoint.pt \
+      --classifier-checkpoint artifacts/new_v2/classifier_real/classifier_checkpoint.pt \
+      --output-dir artifacts/new_v2/final \
+      --train-split train \
+      --eval-split validation \
+      --patch-size 128 \
+      --stride 128 \
+      --epochs 20 \
+      --tspn-learning-rate 5e-6 \
+      --classifier-learning-rate 2e-5 \
+      --classification-weight 1.0 \
+      --mmd-weight 0.1 \
+      --swd-weight 0.1 \
+      --moment-weight 0.05 \
+      --device cuda
+
+Checkpoint selection
+--------------------
+
+Do not select a model using validation loss alone. For every saved candidate checkpoint, record:
+
+- HE-only accuracy
+- real-IHC accuracy
+- synthetic-IHC accuracy
+- random-IHC accuracy
+- synthetic-IHC accuracy minus HE-only accuracy
+- synthetic-IHC accuracy minus real-IHC accuracy
+- prediction-change rates
+- confusion matrix and per-class metrics
+
+A useful checkpoint should satisfy all of the following:
+
+- synthetic-IHC accuracy is close to real-IHC accuracy
+- synthetic-IHC accuracy is higher than HE-only accuracy
+- random-IHC accuracy is meaningfully lower than synthetic-IHC accuracy
+- results are stable across multiple random seeds
+
+Evaluation protocol
+-------------------
+
+1. Use validation only for model selection and ablation tuning.
+2. Keep the test split untouched until the final model is selected.
+3. Repeat the final ablation with at least three seeds when practical, especially for the random-IHC condition.
+4. Report absolute accuracy and the number of correctly classified slides, not only percentages.
+5. Compare against the Stage 0 real-IHC classifier, the HE-only baseline, the current final_concat model, and the new model.
+
+Expected outcome
+----------------
+
+The goal is not merely to improve overall accuracy. The new model should demonstrate that:
+
+- IHC provides measurable information beyond HE.
+- synthetic IHC approaches the performance of real IHC.
+- the classifier responds to meaningful IHC and not arbitrary random features.
+- the result remains consistent on the untouched test split.

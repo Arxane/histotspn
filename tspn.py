@@ -41,26 +41,12 @@ class TSPN(nn.Module):
         self.n_heads = n_heads
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=input_dim,
-            nhead=n_heads,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
+            d_model=input_dim, nhead=n_heads, dim_feedforward=dim_feedforward, dropout=dropout, activation="gelu", batch_first=True
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=max(num_decoder_layers, 1))
         self.seeds = nn.Parameter(torch.randn(n_seeds, input_dim) * 0.02)
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=input_dim,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(input_dim, dim_feedforward),
-            nn.GELU(),
-            nn.Linear(dim_feedforward, input_dim),
-        )
+        self.cross_attention = nn.MultiheadAttention(embed_dim=input_dim, num_heads=n_heads, dropout=dropout, batch_first=True)
+        self.decoder = nn.Sequential(nn.Linear(input_dim, dim_feedforward), nn.GELU(), nn.Linear(dim_feedforward, input_dim))
 
     def forward(self, he_patches: torch.Tensor) -> torch.Tensor:
         if he_patches.dim() != 2:
@@ -83,54 +69,26 @@ def _validate_feature_sets(syn_feats: torch.Tensor, real_feats: torch.Tensor) ->
         raise ValueError("Feature sets must not be empty")
 
 
-def mmd_loss(
-    syn_feats: torch.Tensor,
-    real_feats: torch.Tensor,
-    bandwidths: Iterable[float] = (0.5, 1.0, 2.0),
-) -> torch.Tensor:
+def mmd_loss(syn_feats: torch.Tensor, real_feats: torch.Tensor, bandwidths: Iterable[float] = (0.5, 1.0, 2.0)) -> torch.Tensor:
 
     _validate_feature_sets(syn_feats, real_feats)
 
-    ss_dist = torch.cdist(
-        syn_feats, syn_feats
-    ).square()
+    ss_dist = torch.cdist(syn_feats, syn_feats).square()
 
-    rr_dist = torch.cdist(
-        real_feats, real_feats
-    ).square()
+    rr_dist = torch.cdist(real_feats, real_feats).square()
 
-    sr_dist = torch.cdist(
-        syn_feats, real_feats
-    ).square()
+    sr_dist = torch.cdist(syn_feats, real_feats).square()
 
     if not hasattr(mmd_loss, "_printed_diagnostics"):
         print("\n[MMD diagnostics]")
-        print(
-            f"syn feature norm: "
-            f"{syn_feats.norm(dim=1).mean().item():.4f}"
-        )
-        print(
-            f"real feature norm: "
-            f"{real_feats.norm(dim=1).mean().item():.4f}"
-        )
+        print(f"syn feature norm: " f"{syn_feats.norm(dim=1).mean().item():.4f}")
+        print(f"real feature norm: " f"{real_feats.norm(dim=1).mean().item():.4f}")
 
-        print(
-            f"syn-syn squared distance: "
-            f"mean={ss_dist.mean().item():.4f}, "
-            f"median={ss_dist.median().item():.4f}"
-        )
+        print(f"syn-syn squared distance: " f"mean={ss_dist.mean().item():.4f}, " f"median={ss_dist.median().item():.4f}")
 
-        print(
-            f"real-real squared distance: "
-            f"mean={rr_dist.mean().item():.4f}, "
-            f"median={rr_dist.median().item():.4f}"
-        )
+        print(f"real-real squared distance: " f"mean={rr_dist.mean().item():.4f}, " f"median={rr_dist.median().item():.4f}")
 
-        print(
-            f"syn-real squared distance: "
-            f"mean={sr_dist.mean().item():.4f}, "
-            f"median={sr_dist.median().item():.4f}"
-        )
+        print(f"syn-real squared distance: " f"mean={sr_dist.mean().item():.4f}, " f"median={sr_dist.median().item():.4f}")
 
         for bandwidth in bandwidths:
             scale = 2.0 * bandwidth * bandwidth
@@ -139,12 +97,7 @@ def mmd_loss(
             k_rr = torch.exp(-rr_dist / scale)
             k_sr = torch.exp(-sr_dist / scale)
 
-            print(
-                f"sigma={bandwidth}: "
-                f"Kss={k_ss.mean().item():.6e}, "
-                f"Krr={k_rr.mean().item():.6e}, "
-                f"Ksr={k_sr.mean().item():.6e}"
-            )
+            print(f"sigma={bandwidth}: " f"Kss={k_ss.mean().item():.6e}, " f"Krr={k_rr.mean().item():.6e}, " f"Ksr={k_sr.mean().item():.6e}")
 
         mmd_loss._printed_diagnostics = True
 
@@ -152,22 +105,14 @@ def mmd_loss(
 
     for bandwidth in bandwidths:
         if bandwidth <= 0:
-            raise ValueError(
-                "MMD bandwidths must be positive"
-            )
+            raise ValueError("MMD bandwidths must be positive")
 
         scale = 2.0 * bandwidth * bandwidth
 
-        losses.append(
-            torch.exp(-ss_dist / scale).mean()
-            + torch.exp(-rr_dist / scale).mean()
-            - 2.0 * torch.exp(-sr_dist / scale).mean()
-        )
+        losses.append(torch.exp(-ss_dist / scale).mean() + torch.exp(-rr_dist / scale).mean() - 2.0 * torch.exp(-sr_dist / scale).mean())
 
     if not losses:
-        raise ValueError(
-            "At least one MMD bandwidth is required"
-        )
+        raise ValueError("At least one MMD bandwidth is required")
 
     return torch.stack(losses).mean()
 
@@ -185,12 +130,7 @@ def sliced_wasserstein(syn_feats: torch.Tensor, real_feats: torch.Tensor, n_proj
     def resize(values: torch.Tensor) -> torch.Tensor:
         if values.shape[0] == target_size:
             return values
-        return F.interpolate(
-            values.transpose(0, 1).unsqueeze(0),
-            size=target_size,
-            mode="linear",
-            align_corners=False,
-        ).squeeze(0).transpose(0, 1)
+        return F.interpolate(values.transpose(0, 1).unsqueeze(0), size=target_size, mode="linear", align_corners=False).squeeze(0).transpose(0, 1)
 
     return (resize(syn_proj) - resize(real_proj)).abs().mean()
 
@@ -205,6 +145,7 @@ def moment_matching_loss(syn_feats: torch.Tensor, real_feats: torch.Tensor) -> t
 
     return mean_loss + 0.1 * F.mse_loss(covariance(syn_feats), covariance(real_feats))
 
+
 def tspn_joint_loss(
     syn_feats: torch.Tensor,
     real_feats: torch.Tensor,
@@ -217,57 +158,29 @@ def tspn_joint_loss(
     classification_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
 
-    mmd = mmd_loss(
-        syn_feats,
-        real_feats,
-    )
+    mmd = mmd_loss(syn_feats, real_feats)
 
-    swd = sliced_wasserstein(
-        syn_feats,
-        real_feats,
-    )
+    swd = sliced_wasserstein(syn_feats, real_feats)
 
-    moment = moment_matching_loss(
-        syn_feats,
-        real_feats,
-    )
+    moment = moment_matching_loss(syn_feats, real_feats)
 
-    student = (
-        logits.unsqueeze(0)
-        if logits.dim() == 1
-        else logits
-    )
+    student = logits.unsqueeze(0) if logits.dim() == 1 else logits
 
     target = labels.reshape(-1).long()
 
-    classification = F.cross_entropy(
-        student,
-        target,
-    )
+    classification = F.cross_entropy(student, target)
 
-    total = (
-        classification_weight * classification
-        + mmd_weight * mmd
-        + swd_weight * swd
-        + moment_weight * moment
-    )
+    total = classification_weight * classification + mmd_weight * mmd + swd_weight * swd + moment_weight * moment
 
     components = {
-        "classification": float(
-            classification.detach().item()
-        ),
-        "mmd": float(
-            mmd.detach().item()
-        ),
-        "swd": float(
-            swd.detach().item()
-        ),
-        "moment": float(
-            moment.detach().item()
-        ),
+        "classification": float(classification.detach().item()),
+        "mmd": float(mmd.detach().item()),
+        "swd": float(swd.detach().item()),
+        "moment": float(moment.detach().item()),
     }
 
     return total, components
+
 
 def tspn_distribution_loss(
     syn_feats: torch.Tensor,
@@ -290,11 +203,7 @@ def tspn_distribution_loss(
     student = logits_syn.unsqueeze(0) if logits_syn.dim() == 1 else logits_syn
     teacher = logits_real.detach().unsqueeze(0) if logits_real.dim() == 1 else logits_real.detach()
     target = labels.reshape(-1).long()
-    kl = F.kl_div(
-        F.log_softmax(student / temperature, dim=-1),
-        F.softmax(teacher / temperature, dim=-1),
-        reduction="batchmean",
-    ) * temperature**2
+    kl = F.kl_div(F.log_softmax(student / temperature, dim=-1), F.softmax(teacher / temperature, dim=-1), reduction="batchmean") * temperature**2
     task = F.cross_entropy(student, target)
     total = alpha * mmd + beta * swd + gamma * mom + delta * kl + eta * task
     components = {
